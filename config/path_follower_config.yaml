@@ -13,14 +13,14 @@ path_follower:
     max_steering_angle: 0.4      # Maximum steering angle (radians, ~23 degrees)
     
     # Speed control
-    target_speed: 2.5            # Fallback target speed (m/s) when no planner velocity
-    max_speed: 5.0               # Maximum speed (m/s)
-    min_speed: 1.0               # Minimum speed (m/s)
+    target_speed: 6.0            # Fallback target speed (m/s) when no planner velocity - INCREASED
+    max_speed: 8.0               # Maximum speed (m/s) - INCREASED
+    min_speed: 1.5              # Minimum speed (m/s) - INCREASED
     speed_lookahead_gain: 0.5    # Speed adjustment gain
     
     # Planner velocity integration
     use_planner_velocity: true   # Use velocity from planner (PathWithVelocity)
-    velocity_scale_factor: 0.8   # Scale factor for planner velocity (0.0-1.0)
+    velocity_scale_factor: 1.6   # Scale factor for planner velocity (80% of planned velocity)
     velocity_smoothing: 0.2      # Smoothing factor for velocity changes
     
     # Corner handling
