@@ -11,6 +11,10 @@
 #include <cmath>
 #include <vector>
 #include <mutex>
+#include <csignal>
+#include <atomic>
+#include <thread>
+#include <chrono>
 
 namespace path_follower_pkg {
 
@@ -53,6 +57,9 @@ class PathFollower : public rclcpp::Node {
 public:
     PathFollower();
     virtual ~PathFollower();
+    
+    // Public safety functions
+    void shutdown_handler();
 
 private:
     bool initialize();
@@ -79,6 +86,9 @@ private:
     double distance_to_path(const nav_msgs::msg::Path& path, const VehicleState& vehicle);
     bool is_path_valid(const nav_msgs::msg::Path& path);
     
+    // Safety functions
+    void publish_stop_command();
+    
     // ROS components
     rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
@@ -99,6 +109,9 @@ private:
     bool path_received_;
     bool emergency_stop_;
     int last_target_index_;
+    
+    // Shutdown control
+    std::atomic<bool> shutdown_requested_;
 };
 
 } // namespace path_follower_pkg

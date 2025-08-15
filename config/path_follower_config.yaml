@@ -13,7 +13,7 @@ path_follower:
     max_steering_angle: 0.4      # Maximum steering angle (radians, ~23 degrees)
     
     # Speed control
-    target_speed: 3.0            # Target speed (m/s)
+    target_speed: 2.5            # Target speed (m/s)
     max_speed: 5.0               # Maximum speed (m/s)
     min_speed: 1.0               # Minimum speed (m/s)
     speed_lookahead_gain: 0.5    # Speed adjustment gain

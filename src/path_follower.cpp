@@ -6,7 +6,8 @@ PathFollower::PathFollower()
     : Node("path_follower"),
       path_received_(false),
       emergency_stop_(false),
-      last_target_index_(0) {
+      last_target_index_(0),
+      shutdown_requested_(false) {
     
     if (!initialize()) {
         RCLCPP_ERROR(this->get_logger(), "Failed to initialize path follower");
@@ -17,6 +18,8 @@ PathFollower::PathFollower()
 }
 
 PathFollower::~PathFollower() {
+    // Ensure car stops when node is destroyed
+    publish_stop_command();
 }
 
 bool PathFollower::initialize() {
@@ -58,7 +61,7 @@ bool PathFollower::initialize() {
         std::bind(&PathFollower::path_callback, this, std::placeholders::_1));
         
     odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-        "/ego_racecar/odom", 10,
+        "/pf/pose/odom", 10,
         std::bind(&PathFollower::odom_callback, this, std::placeholders::_1));
     
     // Initialize control timer (50 Hz)
@@ -109,20 +112,22 @@ void PathFollower::odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
 }
 
 void PathFollower::control_timer_callback() {
-    if (!vehicle_state_.valid || !path_received_) {
-        // Send stop command if no valid state or path
-        auto drive_msg = ackermann_msgs::msg::AckermannDriveStamped();
-        drive_msg.header.stamp = this->get_clock()->now();
-        drive_msg.drive.speed = 0.0;
-        drive_msg.drive.steering_angle = 0.0;
-        drive_pub_->publish(drive_msg);
+    // Check if shutdown was requested
+    if (shutdown_requested_.load()) {
+        publish_stop_command();
         return;
     }
     
-    // Check if path is too old (emergency stop after 1 second)
+    if (!vehicle_state_.valid || !path_received_) {
+        // Send stop command if no valid state or path
+        publish_stop_command();
+        return;
+    }
+    
+    // Check if path is too old (emergency stop after 2 seconds)
     auto current_time = this->get_clock()->now();
     auto path_age = (current_time - last_path_time_).seconds();
-    if (path_age > 1.0) {
+    if (path_age > 2.0) {
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 
                              1000, "Path is too old, stopping vehicle");
         emergency_stop_ = true;
@@ -131,11 +136,7 @@ void PathFollower::control_timer_callback() {
     }
     
     if (emergency_stop_) {
-        auto drive_msg = ackermann_msgs::msg::AckermannDriveStamped();
-        drive_msg.header.stamp = current_time;
-        drive_msg.drive.speed = 0.0;
-        drive_msg.drive.steering_angle = 0.0;
-        drive_pub_->publish(drive_msg);
+        publish_stop_command();
         return;
     }
     
@@ -441,6 +442,33 @@ double PathFollower::predict_required_steering(const nav_msgs::msg::Path& path, 
     }
     
     return 0.0;
+}
+
+void PathFollower::publish_stop_command() {
+    auto drive_msg = ackermann_msgs::msg::AckermannDriveStamped();
+    drive_msg.header.stamp = this->get_clock()->now();
+    drive_msg.header.frame_id = "base_link";
+    drive_msg.drive.speed = 0.0;
+    drive_msg.drive.steering_angle = 0.0;
+    drive_msg.drive.acceleration = -5.0;  // Emergency brake
+    drive_msg.drive.jerk = 0.0;
+    drive_msg.drive.steering_angle_velocity = 0.0;
+    
+    drive_pub_->publish(drive_msg);
+    
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                         "Publishing stop command - Vehicle stopped for safety");
+}
+
+void PathFollower::shutdown_handler() {
+    RCLCPP_WARN(this->get_logger(), "Shutdown signal received - stopping vehicle safely");
+    shutdown_requested_.store(true);
+    
+    // Publish multiple stop commands to ensure vehicle stops
+    for (int i = 0; i < 5; ++i) {
+        publish_stop_command();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
 }
 
 } // namespace path_follower_pkg
