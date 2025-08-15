@@ -16,6 +16,7 @@ find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(rcl_interfaces REQUIRED)
+find_package(planning_custom_msgs REQUIRED)
 
 # include directories
 include_directories(include)
@@ -41,6 +42,7 @@ ament_target_dependencies(path_follower_node
   tf2
   tf2_ros
   tf2_geometry_msgs
+  planning_custom_msgs
 )
 
 ament_target_dependencies(safety_monitor_node
@@ -48,6 +50,7 @@ ament_target_dependencies(safety_monitor_node
   std_msgs
   ackermann_msgs
   rcl_interfaces
+  planning_custom_msgs
 )
 
 # install targets

@@ -4,19 +4,29 @@ path_follower:
   ros__parameters:
     # Pure Pursuit parameters
     lookahead_distance: 2.5       # Base lookahead distance (m)
-    min_lookahead: 1.0           # Minimum lookahead distance (m)
+    min_lookahead: 1.2           # Minimum lookahead distance (m) - slightly increased
     max_lookahead: 4.0           # Maximum lookahead distance (m)
-    lookahead_ratio: 0.3         # Dynamic lookahead: distance = velocity * ratio
+    lookahead_ratio: 0.4         # Dynamic lookahead: distance = velocity * ratio
     
     # Vehicle parameters
     wheelbase: 0.33              # Vehicle wheelbase (m) - matches lattice planner
     max_steering_angle: 0.4      # Maximum steering angle (radians, ~23 degrees)
     
     # Speed control
-    target_speed: 2.5            # Target speed (m/s)
+    target_speed: 2.5            # Fallback target speed (m/s) when no planner velocity
     max_speed: 5.0               # Maximum speed (m/s)
     min_speed: 1.0               # Minimum speed (m/s)
     speed_lookahead_gain: 0.5    # Speed adjustment gain
+    
+    # Planner velocity integration
+    use_planner_velocity: true   # Use velocity from planner (PathWithVelocity)
+    velocity_scale_factor: 0.8   # Scale factor for planner velocity (0.0-1.0)
+    velocity_smoothing: 0.2      # Smoothing factor for velocity changes
+    
+    # Corner handling
+    corner_detection_angle: 0.3    # Corner detection threshold (radians)
+    corner_speed_factor: 0.7       # Speed reduction factor in corners
+    anticipation_distance: 2.0     # Look-ahead distance for corner detection (m)
     
     # Safety parameters
     max_lateral_error: 2.0       # Maximum lateral error before speed reduction

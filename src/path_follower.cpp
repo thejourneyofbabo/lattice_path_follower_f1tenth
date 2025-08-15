@@ -7,7 +7,9 @@ PathFollower::PathFollower()
       path_received_(false),
       emergency_stop_(false),
       last_target_index_(0),
-      shutdown_requested_(false) {
+      shutdown_requested_(false),
+      has_velocity_path_(false),
+      smoothed_velocity_(0.0) {
     
     if (!initialize()) {
         RCLCPP_ERROR(this->get_logger(), "Failed to initialize path follower");
@@ -36,6 +38,9 @@ bool PathFollower::initialize() {
     this->declare_parameter("corner_detection_angle", config_.corner_detection_angle);
     this->declare_parameter("corner_speed_factor", config_.corner_speed_factor);
     this->declare_parameter("anticipation_distance", config_.anticipation_distance);
+    this->declare_parameter("use_planner_velocity", config_.use_planner_velocity);
+    this->declare_parameter("velocity_scale_factor", config_.velocity_scale_factor);
+    this->declare_parameter("velocity_smoothing", config_.velocity_smoothing);
     
     // Get parameters
     config_.lookahead_distance = this->get_parameter("lookahead_distance").as_double();
@@ -50,6 +55,9 @@ bool PathFollower::initialize() {
     config_.corner_detection_angle = this->get_parameter("corner_detection_angle").as_double();
     config_.corner_speed_factor = this->get_parameter("corner_speed_factor").as_double();
     config_.anticipation_distance = this->get_parameter("anticipation_distance").as_double();
+    config_.use_planner_velocity = this->get_parameter("use_planner_velocity").as_bool();
+    config_.velocity_scale_factor = this->get_parameter("velocity_scale_factor").as_double();
+    config_.velocity_smoothing = this->get_parameter("velocity_smoothing").as_double();
     
     // Initialize publishers
     drive_pub_ = this->create_publisher<ackermann_msgs::msg::AckermannDriveStamped>(
@@ -59,6 +67,10 @@ bool PathFollower::initialize() {
     path_sub_ = this->create_subscription<nav_msgs::msg::Path>(
         "/planned_path", 10,
         std::bind(&PathFollower::path_callback, this, std::placeholders::_1));
+        
+    path_with_velocity_sub_ = this->create_subscription<planning_custom_msgs::msg::PathWithVelocity>(
+        "/planned_path_with_velocity", 10,
+        std::bind(&PathFollower::path_with_velocity_callback, this, std::placeholders::_1));
         
     odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
         "/pf/pose/odom", 10,
@@ -88,6 +100,23 @@ void PathFollower::path_callback(const nav_msgs::msg::Path::SharedPtr msg) {
     
     RCLCPP_DEBUG(this->get_logger(), "Received new path with %zu points", 
                  current_path_.poses.size());
+}
+
+void PathFollower::path_with_velocity_callback(const planning_custom_msgs::msg::PathWithVelocity::SharedPtr msg) {
+    if (msg->points.empty()) {
+        RCLCPP_WARN(this->get_logger(), "Received empty velocity path");
+        return;
+    }
+    
+    std::lock_guard<std::mutex> lock(path_mutex_);
+    current_velocity_path_ = *msg;
+    has_velocity_path_ = true;
+    path_received_ = true;
+    last_path_time_ = this->get_clock()->now();
+    last_target_index_ = 0;  // Reset target index for new path
+    
+    RCLCPP_DEBUG(this->get_logger(), "Received new velocity path with %zu points, velocity_scale_factor=%.2f", 
+                 current_velocity_path_.points.size(), config_.velocity_scale_factor);
 }
 
 void PathFollower::odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
@@ -184,14 +213,30 @@ std::pair<double, double> PathFollower::pure_pursuit_control() {
     double target_x = path.poses[target_index].pose.position.x;
     double target_y = path.poses[target_index].pose.position.y;
     
-    // Calculate steering angle
-    double steering_angle = calculate_steering_angle(target_x, target_y, vehicle);
+    // Calculate steering angle with hybrid approach
+    double pure_pursuit_angle = calculate_steering_angle(target_x, target_y, vehicle);
+    
+    // HYBRID CONTROL: Add cross-track error correction (Stanley-like)
+    double cross_track_correction = calculate_cross_track_correction(path, vehicle, target_index);
+    double steering_angle = pure_pursuit_angle + cross_track_correction;
+    
+    RCLCPP_DEBUG(this->get_logger(), "Steering: PP=%.3f, CT=%.3f, Total=%.3f", 
+                 pure_pursuit_angle, cross_track_correction, steering_angle);
     
     // Calculate lateral error for speed adjustment
     double lateral_error = distance_to_path(path, vehicle);
     
+    // Get velocity from planner if available
+    double planner_velocity = get_velocity_at_point(target_index);
+    
+    // DEBUG: Log path following behavior
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+        "Path Follow: target_idx=%d, lookahead=%.2fm, steering=%.3frad, corner=%s, lat_err=%.2fm", 
+        target_index, calculate_lookahead_distance(vehicle.velocity, in_corner), 
+        steering_angle, in_corner ? "YES" : "NO", lateral_error);
+    
     // Calculate target speed (with corner handling)
-    double speed = calculate_target_speed(steering_angle, lateral_error, in_corner);
+    double speed = calculate_target_speed(steering_angle, lateral_error, in_corner, planner_velocity);
     
     if (in_corner) {
         RCLCPP_DEBUG(this->get_logger(), "Corner detected! Reducing speed to %.2f", speed);
@@ -252,9 +297,10 @@ int PathFollower::find_target_point(const nav_msgs::msg::Path& path,
 double PathFollower::calculate_lookahead_distance(double velocity, bool in_corner) {
     double dynamic_lookahead = velocity * config_.lookahead_ratio;
     
-    // Reduce lookahead distance in corners for better tracking
+    // Slightly reduce lookahead distance in corners for better tracking
     if (in_corner) {
-        dynamic_lookahead *= 0.7;  // 70% of normal lookahead in corners
+        dynamic_lookahead *= 0.9;  // Small reduction, not aggressive
+        RCLCPP_DEBUG(this->get_logger(), "Corner detected: adjusted lookahead %.2fm", dynamic_lookahead);
     }
     
     return std::clamp(dynamic_lookahead, config_.min_lookahead, config_.max_lookahead);
@@ -286,15 +332,107 @@ double PathFollower::calculate_steering_angle(double target_x, double target_y,
     return steering_angle;
 }
 
-double PathFollower::calculate_target_speed(double steering_angle, double lateral_error, bool in_corner) {
-    // Base speed reduction based on steering angle (more aggressive)
+double PathFollower::calculate_cross_track_correction(const nav_msgs::msg::Path& path, const VehicleState& vehicle, int target_index) {
+    if (path.poses.empty() || target_index < 0 || target_index >= static_cast<int>(path.poses.size())) {
+        return 0.0;
+    }
+    
+    // Find closest point for cross-track error calculation
+    double min_distance = std::numeric_limits<double>::max();
+    int closest_index = 0;
+    double cross_track_error = 0.0;
+    
+    // Look in a small window around target index for efficiency
+    int start_idx = std::max(0, target_index - 5);
+    int end_idx = std::min(static_cast<int>(path.poses.size()) - 1, target_index + 5);
+    
+    for (int i = start_idx; i <= end_idx; ++i) {
+        double dx = path.poses[i].pose.position.x - vehicle.x;
+        double dy = path.poses[i].pose.position.y - vehicle.y;
+        double distance = std::sqrt(dx*dx + dy*dy);
+        
+        if (distance < min_distance) {
+            min_distance = distance;
+            closest_index = i;
+        }
+    }
+    
+    if (closest_index < static_cast<int>(path.poses.size()) - 1) {
+        // Get path direction at closest point
+        double path_x1 = path.poses[closest_index].pose.position.x;
+        double path_y1 = path.poses[closest_index].pose.position.y;
+        double path_x2 = path.poses[closest_index + 1].pose.position.x;
+        double path_y2 = path.poses[closest_index + 1].pose.position.y;
+        
+        double path_dx = path_x2 - path_x1;
+        double path_dy = path_y2 - path_y1;
+        double path_length = std::sqrt(path_dx*path_dx + path_dy*path_dy);
+        
+        if (path_length > 1e-6) {
+            // Normalize path direction
+            path_dx /= path_length;
+            path_dy /= path_length;
+            
+            // Calculate cross-track error (signed distance)
+            double vehicle_to_path_x = vehicle.x - path_x1;
+            double vehicle_to_path_y = vehicle.y - path_y1;
+            
+            // Cross product gives signed distance
+            cross_track_error = vehicle_to_path_x * (-path_dy) + vehicle_to_path_y * path_dx;
+            
+            // Stanley-like correction gain (proportional to cross-track error)
+            double k_cross_track = 0.5; // Tuning parameter
+            double correction = -k_cross_track * std::atan(cross_track_error / (vehicle.velocity + 0.1));
+            
+            // Limit correction to prevent oscillation
+            correction = std::clamp(correction, -0.2, 0.2); // ±0.2 rad limit
+            
+            RCLCPP_DEBUG(this->get_logger(), "Cross-track: error=%.3fm, correction=%.3frad", 
+                         cross_track_error, correction);
+            
+            return correction;
+        }
+    }
+    
+    return 0.0;
+}
+
+double PathFollower::calculate_target_speed(double steering_angle, double lateral_error, bool in_corner, double planner_velocity) {
+    double base_speed;
+    
+    // Use planner velocity if available and enabled
+    if (config_.use_planner_velocity && planner_velocity > 0.0) {
+        // Scale and smooth planner velocity
+        double scaled_velocity = planner_velocity * config_.velocity_scale_factor;
+        
+        // Smooth velocity changes
+        if (smoothed_velocity_ > 0.0) {
+            smoothed_velocity_ = smoothed_velocity_ * (1.0 - config_.velocity_smoothing) + 
+                               scaled_velocity * config_.velocity_smoothing;
+        } else {
+            smoothed_velocity_ = scaled_velocity;
+        }
+        
+        base_speed = smoothed_velocity_;
+        
+        RCLCPP_DEBUG(this->get_logger(), "Using planner velocity: raw=%.2f, scaled=%.2f, smoothed=%.2f", 
+                     planner_velocity, scaled_velocity, base_speed);
+    } else {
+        // Fallback to configured target speed
+        base_speed = config_.target_speed;
+        smoothed_velocity_ = base_speed;  // Update smoothed velocity for consistency
+    }
+    
+    // Base speed reduction based on steering angle (less aggressive when using planner velocity)
     double abs_steering = std::abs(steering_angle);
-    double steering_factor = 1.0 - (abs_steering / config_.max_steering_angle) * 0.8;  // More aggressive
+    double steering_factor = config_.use_planner_velocity && planner_velocity > 0.0 ? 
+                            1.0 - (abs_steering / config_.max_steering_angle) * 0.3 :  // Less aggressive with planner
+                            1.0 - (abs_steering / config_.max_steering_angle) * 0.8;   // More aggressive fallback
     
     // Reduce speed based on lateral error
     double error_factor = 1.0 - std::min(lateral_error / config_.max_lateral_error, 1.0) * 0.4;
     
-    double target_speed = config_.target_speed * steering_factor * error_factor;
+    double target_speed = base_speed * steering_factor * error_factor;
     
     // Apply corner speed reduction
     if (in_corner) {
@@ -336,6 +474,15 @@ bool PathFollower::is_path_valid(const nav_msgs::msg::Path& path) {
     }
     
     return true;
+}
+
+double PathFollower::get_velocity_at_point(int target_index) const {
+    if (!has_velocity_path_ || target_index < 0 || 
+        target_index >= static_cast<int>(current_velocity_path_.points.size())) {
+        return -1.0; // Invalid velocity
+    }
+    
+    return current_velocity_path_.points[target_index].velocity;
 }
 
 bool PathFollower::detect_upcoming_corner(const nav_msgs::msg::Path& path, const VehicleState& vehicle) {
