@@ -73,7 +73,7 @@ bool PathFollower::initialize() {
         std::bind(&PathFollower::path_with_velocity_callback, this, std::placeholders::_1));
         
     odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-        "/pf/pose/odom", 10,
+        "/odom", 10,
         std::bind(&PathFollower::odom_callback, this, std::placeholders::_1));
     
     // Initialize control timer (50 Hz)
